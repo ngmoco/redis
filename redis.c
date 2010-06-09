@@ -60,7 +60,6 @@
 #include <float.h>
 #include <math.h>
 #include <pthread.h>
-#include <syslog.h>
 
 #if defined(__sun)
 #include "solarisfixes.h"
@@ -215,6 +214,12 @@ static char* strencoding[] = {
 #define REDIS_SORT_ASC 1
 #define REDIS_SORT_DESC 2
 #define REDIS_SORTKEY_MAX 1024
+
+/* Log levels */
+#define REDIS_DEBUG 0
+#define REDIS_VERBOSE 1
+#define REDIS_NOTICE 2
+#define REDIS_WARNING 3
 
 /* Anti-warning macro... */
 #define REDIS_NOTUSED(V) ((void) V)
@@ -373,7 +378,6 @@ struct redisServer {
     struct saveparam *saveparams;
     int saveparamslen;
     char *logfile;
-    int syslog;
     char *bindaddr;
     char *dbfilename;
     char *appendfilename;
@@ -1054,22 +1058,11 @@ static void redisLog(int level, const char *fmt, ...) {
     va_list ap;
     FILE *fp;
 
-    if (level >  server.verbosity) return;
+    fp = (server.logfile == NULL) ? stdout : fopen(server.logfile,"a");
+    if (!fp) return;
 
-    if (server.syslog == 0) {
-        openlog("Redis", LOG_CONS | LOG_PID | LOG_NDELAY, LOG_USER);
-
-        va_start(ap, fmt);
-        syslog(LOG_MAKEPRI(LOG_USER, level), fmt, ap);
-        va_end(ap);
-
-        closelog();
-
-    } else {
-        fp = (server.logfile == NULL) ? stdout : fopen(server.logfile,"a");
-        if (!fp) return;
-
-        va_start(ap, fmt);
+    va_start(ap, fmt);
+    if (level >= server.verbosity) {
         char *c = ".-*#";
         char buf[64];
         time_t now;
@@ -1080,10 +1073,10 @@ static void redisLog(int level, const char *fmt, ...) {
         vfprintf(fp, fmt, ap);
         fprintf(fp,"\n");
         fflush(fp);
-        va_end(ap);
-
-        if (server.logfile) fclose(fp);
     }
+    va_end(ap);
+
+    if (server.logfile) fclose(fp);
 }
 
 /*====================== Hash table type implementation  ==================== */
@@ -1249,7 +1242,7 @@ static void version();
  * is based on heap allocation for send buffers, so we simply abort.
  * At least the code will be simpler to read... */
 static void oom(const char *msg) {
-    redisLog(LOG_WARNING, "%s: Out of memory\n",msg);
+    redisLog(REDIS_WARNING, "%s: Out of memory\n",msg);
     sleep(1);
     abort();
 }
@@ -1271,7 +1264,7 @@ static void closeTimedoutClients(void) {
             listLength(c->pubsub_patterns) == 0 &&
             (now - c->lastinteraction > server.maxidletime))
         {
-            redisLog(LOG_INFO,"Closing idle client");
+            redisLog(REDIS_VERBOSE,"Closing idle client");
             freeClient(c);
         } else if (c->flags & REDIS_BLOCKED) {
             if (c->blockingto != 0 && c->blockingto < now) {
@@ -1325,14 +1318,14 @@ void backgroundSaveDoneHandler(int statloc) {
     int bysignal = WIFSIGNALED(statloc);
 
     if (!bysignal && exitcode == 0) {
-        redisLog(LOG_NOTICE,
+        redisLog(REDIS_NOTICE,
             "Background saving terminated with success");
         server.dirty = 0;
         server.lastsave = time(NULL);
     } else if (!bysignal && exitcode != 0) {
-        redisLog(LOG_WARNING, "Background saving error");
+        redisLog(REDIS_WARNING, "Background saving error");
     } else {
-        redisLog(LOG_WARNING,
+        redisLog(REDIS_WARNING,
             "Background saving terminated by signal %d", WTERMSIG(statloc));
         rdbRemoveTempFile(server.bgsavechildpid);
     }
@@ -1352,48 +1345,48 @@ void backgroundRewriteDoneHandler(int statloc) {
         int fd;
         char tmpfile[256];
 
-        redisLog(LOG_NOTICE,
+        redisLog(REDIS_NOTICE,
             "Background append only file rewriting terminated with success");
         /* Now it's time to flush the differences accumulated by the parent */
         snprintf(tmpfile,256,"temp-rewriteaof-bg-%d.aof", (int) server.bgrewritechildpid);
         fd = open(tmpfile,O_WRONLY|O_APPEND);
         if (fd == -1) {
-            redisLog(LOG_WARNING, "Not able to open the temp append only file produced by the child: %s", strerror(errno));
+            redisLog(REDIS_WARNING, "Not able to open the temp append only file produced by the child: %s", strerror(errno));
             goto cleanup;
         }
         /* Flush our data... */
         if (write(fd,server.bgrewritebuf,sdslen(server.bgrewritebuf)) !=
                 (signed) sdslen(server.bgrewritebuf)) {
-            redisLog(LOG_WARNING, "Error or short write trying to flush the parent diff of the append log file in the child temp file: %s", strerror(errno));
+            redisLog(REDIS_WARNING, "Error or short write trying to flush the parent diff of the append log file in the child temp file: %s", strerror(errno));
             close(fd);
             goto cleanup;
         }
-        redisLog(LOG_NOTICE,"Parent diff flushed into the new append log file with success (%lu bytes)",sdslen(server.bgrewritebuf));
+        redisLog(REDIS_NOTICE,"Parent diff flushed into the new append log file with success (%lu bytes)",sdslen(server.bgrewritebuf));
         /* Now our work is to rename the temp file into the stable file. And
          * switch the file descriptor used by the server for append only. */
         if (rename(tmpfile,server.appendfilename) == -1) {
-            redisLog(LOG_WARNING,"Can't rename the temp append only file into the stable one: %s", strerror(errno));
+            redisLog(REDIS_WARNING,"Can't rename the temp append only file into the stable one: %s", strerror(errno));
             close(fd);
             goto cleanup;
         }
         /* Mission completed... almost */
-        redisLog(LOG_NOTICE,"Append only file successfully rewritten.");
+        redisLog(REDIS_NOTICE,"Append only file successfully rewritten.");
         if (server.appendfd != -1) {
             /* If append only is actually enabled... */
             close(server.appendfd);
             server.appendfd = fd;
             fsync(fd);
             server.appendseldb = -1; /* Make sure it will issue SELECT */
-            redisLog(LOG_NOTICE,"The new append only file was selected for future appends.");
+            redisLog(REDIS_NOTICE,"The new append only file was selected for future appends.");
         } else {
             /* If append only is disabled we just generate a dump in this
              * format. Why not? */
             close(fd);
         }
     } else if (!bysignal && exitcode != 0) {
-        redisLog(LOG_WARNING, "Background append only file rewriting error");
+        redisLog(REDIS_WARNING, "Background append only file rewriting error");
     } else {
-        redisLog(LOG_WARNING,
+        redisLog(REDIS_WARNING,
             "Background append only file rewriting terminated by signal %d",
             WTERMSIG(statloc));
     }
@@ -1433,7 +1426,7 @@ static int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientD
      * not ok doing so inside the signal handler. */
     if (server.shutdown_asap) {
         if (prepareForShutdown() == REDIS_OK) exit(0);
-        redisLog(LOG_WARNING,"SIGTERM received but errors trying to shut down the server, check the logs for more information");
+        redisLog(REDIS_WARNING,"SIGTERM received but errors trying to shut down the server, check the logs for more information");
     }
 
     /* Show some info about non-empty databases */
@@ -1444,7 +1437,7 @@ static int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientD
         used = dictSize(server.db[j].dict);
         vkeys = dictSize(server.db[j].expires);
         if (!(loops % 50) && (used || vkeys)) {
-            redisLog(LOG_INFO,"DB %d: %lld keys (%lld volatile) in %lld slots HT.",j,used,vkeys,size);
+            redisLog(REDIS_VERBOSE,"DB %d: %lld keys (%lld volatile) in %lld slots HT.",j,used,vkeys,size);
             /* dictPrintStats(server.dict); */
         }
     }
@@ -1462,7 +1455,7 @@ static int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientD
 
     /* Show information about connected clients */
     if (!(loops % 50)) {
-        redisLog(LOG_INFO,"%d clients connected (%d slaves), %zu bytes in use",
+        redisLog(REDIS_VERBOSE,"%d clients connected (%d slaves), %zu bytes in use",
             listLength(server.clients)-listLength(server.slaves),
             listLength(server.slaves),
             zmalloc_used_memory());
@@ -1494,7 +1487,7 @@ static int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientD
 
             if (server.dirty >= sp->changes &&
                 now-server.lastsave > sp->seconds) {
-                redisLog(LOG_NOTICE,"%d changes in %d seconds. Saving...",
+                redisLog(REDIS_NOTICE,"%d changes in %d seconds. Saving...",
                     sp->changes, sp->seconds);
                 rdbSaveBackground(server.dbfilename);
                 break;
@@ -1550,7 +1543,7 @@ static int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientD
                 zmalloc_used_memory() >
                 (server.vm_max_memory+server.vm_max_memory/10))
             {
-                redisLog(LOG_WARNING,"WARNING: vm-max-memory limit exceeded by more than 10%% but unable to swap more objects out!");
+                redisLog(REDIS_WARNING,"WARNING: vm-max-memory limit exceeded by more than 10%% but unable to swap more objects out!");
             }
             /* Note that when using threade I/O we free just one object,
              * because anyway when the I/O thread in charge to swap this
@@ -1562,9 +1555,9 @@ static int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientD
 
     /* Check if we should connect to a MASTER */
     if (server.replstate == REDIS_REPL_CONNECT && !(loops % 10)) {
-        redisLog(LOG_NOTICE,"Connecting to MASTER...");
+        redisLog(REDIS_NOTICE,"Connecting to MASTER...");
         if (syncWithMaster() == REDIS_OK) {
-            redisLog(LOG_NOTICE,"MASTER <-> SLAVE sync succeeded");
+            redisLog(REDIS_NOTICE,"MASTER <-> SLAVE sync succeeded");
             if (server.appendonly) rewriteAppendOnlyFileBackground();
         }
     }
@@ -1673,11 +1666,10 @@ static void resetServerSaveParams() {
 static void initServerConfig() {
     server.dbnum = REDIS_DEFAULT_DBNUM;
     server.port = REDIS_SERVERPORT;
-    server.verbosity = LOG_INFO;
+    server.verbosity = REDIS_VERBOSE;
     server.maxidletime = REDIS_MAXIDLETIME;
     server.saveparams = NULL;
     server.logfile = NULL; /* NULL = log on standard output */
-    server.syslog = -1;
     server.bindaddr = NULL;
     server.glueoutputbuf = 1;
     server.daemonize = 0;
@@ -1735,7 +1727,7 @@ static void initServer() {
 
     server.devnull = fopen("/dev/null","w");
     if (server.devnull == NULL) {
-        redisLog(LOG_WARNING, "Can't open /dev/null: %s", server.neterr);
+        redisLog(REDIS_WARNING, "Can't open /dev/null: %s", server.neterr);
         exit(1);
     }
     server.clients = listCreate();
@@ -1747,7 +1739,7 @@ static void initServer() {
     server.db = zmalloc(sizeof(redisDb)*server.dbnum);
     server.fd = anetTcpServer(server.neterr, server.port, server.bindaddr);
     if (server.fd == -1) {
-        redisLog(LOG_WARNING, "Opening TCP port: %s", server.neterr);
+        redisLog(REDIS_WARNING, "Opening TCP port: %s", server.neterr);
         exit(1);
     }
     for (j = 0; j < server.dbnum; j++) {
@@ -1781,7 +1773,7 @@ static void initServer() {
     if (server.appendonly) {
         server.appendfd = open(server.appendfilename,O_WRONLY|O_APPEND|O_CREAT,0644);
         if (server.appendfd == -1) {
-            redisLog(LOG_WARNING, "Can't open the append-only file: %s",
+            redisLog(REDIS_WARNING, "Can't open the append-only file: %s",
                 strerror(errno));
             exit(1);
         }
@@ -1821,7 +1813,7 @@ static void loadServerConfig(char *filename) {
         fp = stdin;
     else {
         if ((fp = fopen(filename,"r")) == NULL) {
-            redisLog(LOG_WARNING, "Fatal error, can't open config file '%s'", filename);
+            redisLog(REDIS_WARNING, "Fatal error, can't open config file '%s'", filename);
             exit(1);
         }
     }
@@ -1866,20 +1858,19 @@ static void loadServerConfig(char *filename) {
             appendServerSaveParams(seconds,changes);
         } else if (!strcasecmp(argv[0],"dir") && argc == 2) {
             if (chdir(argv[1]) == -1) {
-                redisLog(LOG_WARNING,"Can't chdir to '%s': %s",
+                redisLog(REDIS_WARNING,"Can't chdir to '%s': %s",
                     argv[1], strerror(errno));
                 exit(1);
             }
         } else if (!strcasecmp(argv[0],"loglevel") && argc == 2) {
-            if (!strcasecmp(argv[1],"debug")) server.verbosity = LOG_DEBUG;
-            else if (!strcasecmp(argv[1],"verbose")) server.verbosity = LOG_INFO;
-            else if (!strcasecmp(argv[1],"notice")) server.verbosity = LOG_NOTICE;
-            else if (!strcasecmp(argv[1],"warning")) server.verbosity = LOG_WARNING;
+            if (!strcasecmp(argv[1],"debug")) server.verbosity = REDIS_DEBUG;
+            else if (!strcasecmp(argv[1],"verbose")) server.verbosity = REDIS_VERBOSE;
+            else if (!strcasecmp(argv[1],"notice")) server.verbosity = REDIS_NOTICE;
+            else if (!strcasecmp(argv[1],"warning")) server.verbosity = REDIS_WARNING;
             else {
                 err = "Invalid log level. Must be one of debug, notice, warning";
                 goto loaderr;
             }
-            setlogmask (LOG_UPTO (server.verbosity));
         } else if (!strcasecmp(argv[0],"logfile") && argc == 2) {
             FILE *logfp;
 
@@ -1889,19 +1880,15 @@ static void loadServerConfig(char *filename) {
                 server.logfile = NULL;
             }
             if (server.logfile) {
-                if (!strcasecmp(server.logfile,"syslog")) {
-                    server.syslog = 0;
-                } else {
-                    /* Test if we are able to open the file. The server will not
-                     * be able to abort just for this problem later... */
-                    logfp = fopen(server.logfile,"a");
-                    if (logfp == NULL) {
-                        err = sdscatprintf(sdsempty(),
-                            "Can't open the log file: %s", strerror(errno));
-                        goto loaderr;
-                    }
-                    fclose(logfp);
+                /* Test if we are able to open the file. The server will not
+                 * be able to abort just for this problem later... */
+                logfp = fopen(server.logfile,"a");
+                if (logfp == NULL) {
+                    err = sdscatprintf(sdsempty(),
+                        "Can't open the log file: %s", strerror(errno));
+                    goto loaderr;
                 }
+                fclose(logfp);
             }
         } else if (!strcasecmp(argv[0],"databases") && argc == 2) {
             server.dbnum = atoi(argv[1]);
@@ -2153,7 +2140,7 @@ static void sendReplyToClient(aeEventLoop *el, int fd, void *privdata, int mask)
         if (errno == EAGAIN) {
             nwritten = 0;
         } else {
-            redisLog(LOG_INFO,
+            redisLog(REDIS_VERBOSE,
                 "Error writing to client: %s", strerror(errno));
             freeClient(c);
             return;
@@ -2206,7 +2193,7 @@ static void sendReplyToClientWritev(aeEventLoop *el, int fd, void *privdata, int
         /* write all collected blocks at once */
         if((nwritten = writev(fd, iov, ion)) < 0) {
             if (errno != EAGAIN) {
-                redisLog(LOG_INFO,
+                redisLog(REDIS_VERBOSE,
                          "Error writing to client: %s", strerror(errno));
                 freeClient(c);
                 return;
@@ -2644,7 +2631,7 @@ again:
             }
             return;
         } else if (sdslen(c->querybuf) >= REDIS_REQUEST_MAX_SIZE) {
-            redisLog(LOG_INFO, "Client protocol error");
+            redisLog(REDIS_VERBOSE, "Client protocol error");
             freeClient(c);
             return;
         }
@@ -2681,12 +2668,12 @@ static void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mas
         if (errno == EAGAIN) {
             nread = 0;
         } else {
-            redisLog(LOG_INFO, "Reading from client: %s",strerror(errno));
+            redisLog(REDIS_VERBOSE, "Reading from client: %s",strerror(errno));
             freeClient(c);
             return;
         }
     } else if (nread == 0) {
-        redisLog(LOG_INFO, "Client closed connection");
+        redisLog(REDIS_VERBOSE, "Client closed connection");
         freeClient(c);
         return;
     }
@@ -2870,12 +2857,12 @@ static void acceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
 
     cfd = anetAccept(server.neterr, fd, cip, &cport);
     if (cfd == AE_ERR) {
-        redisLog(LOG_INFO,"Accepting client connection: %s", server.neterr);
+        redisLog(REDIS_VERBOSE,"Accepting client connection: %s", server.neterr);
         return;
     }
-    redisLog(LOG_INFO,"Accepted %s:%d", cip, cport);
+    redisLog(REDIS_VERBOSE,"Accepted %s:%d", cip, cport);
     if ((c = createClient(cfd)) == NULL) {
-        redisLog(LOG_WARNING,"Error allocating resoures for the client");
+        redisLog(REDIS_WARNING,"Error allocating resoures for the client");
         close(cfd); /* May be already closed, just ingore errors */
         return;
     }
@@ -3700,7 +3687,7 @@ static int rdbSave(char *filename) {
     snprintf(tmpfile,256,"temp-%d.rdb", (int) getpid());
     fp = fopen(tmpfile,"w");
     if (!fp) {
-        redisLog(LOG_WARNING, "Failed saving the DB: %s", strerror(errno));
+        redisLog(REDIS_WARNING, "Failed saving the DB: %s", strerror(errno));
         return REDIS_ERR;
     }
     if (fwrite("REDIS0001",9,1,fp) == 0) goto werr;
@@ -3765,11 +3752,11 @@ static int rdbSave(char *filename) {
     /* Use RENAME to make sure the DB file is changed atomically only
      * if the generate DB file is ok. */
     if (rename(tmpfile,filename) == -1) {
-        redisLog(LOG_WARNING,"Error moving temp DB file on the final destination: %s", strerror(errno));
+        redisLog(REDIS_WARNING,"Error moving temp DB file on the final destination: %s", strerror(errno));
         unlink(tmpfile);
         return REDIS_ERR;
     }
-    redisLog(LOG_NOTICE,"DB saved on disk");
+    redisLog(REDIS_NOTICE,"DB saved on disk");
     server.dirty = 0;
     server.lastsave = time(NULL);
     return REDIS_OK;
@@ -3777,7 +3764,7 @@ static int rdbSave(char *filename) {
 werr:
     fclose(fp);
     unlink(tmpfile);
-    redisLog(LOG_WARNING,"Write error saving DB on disk: %s", strerror(errno));
+    redisLog(REDIS_WARNING,"Write error saving DB on disk: %s", strerror(errno));
     if (di) dictReleaseIterator(di);
     return REDIS_ERR;
 }
@@ -3799,11 +3786,11 @@ static int rdbSaveBackground(char *filename) {
     } else {
         /* Parent */
         if (childpid == -1) {
-            redisLog(LOG_WARNING,"Can't save in background: fork: %s",
+            redisLog(REDIS_WARNING,"Can't save in background: fork: %s",
                 strerror(errno));
             return REDIS_ERR;
         }
-        redisLog(LOG_NOTICE,"Background saving started by pid %d",childpid);
+        redisLog(REDIS_NOTICE,"Background saving started by pid %d",childpid);
         server.bgsavechildpid = childpid;
         updateDictResizePolicy();
         return REDIS_OK;
@@ -3970,7 +3957,7 @@ static int rdbLoadDoubleValue(FILE *fp, double *val) {
 static robj *rdbLoadObject(int type, FILE *fp) {
     robj *o;
 
-    redisLog(LOG_DEBUG,"LOADING OBJECT %d (at %d)\n",type,ftell(fp));
+    redisLog(REDIS_DEBUG,"LOADING OBJECT %d (at %d)\n",type,ftell(fp));
     if (type == REDIS_STRING) {
         /* Read string value */
         if ((o = rdbLoadEncodedStringObject(fp)) == NULL) return NULL;
@@ -4078,13 +4065,13 @@ static int rdbLoad(char *filename) {
     buf[9] = '\0';
     if (memcmp(buf,"REDIS",5) != 0) {
         fclose(fp);
-        redisLog(LOG_WARNING,"Wrong signature trying to load DB from file");
+        redisLog(REDIS_WARNING,"Wrong signature trying to load DB from file");
         return REDIS_ERR;
     }
     rdbver = atoi(buf+5);
     if (rdbver != 1) {
         fclose(fp);
-        redisLog(LOG_WARNING,"Can't handle RDB format version %d",rdbver);
+        redisLog(REDIS_WARNING,"Can't handle RDB format version %d",rdbver);
         return REDIS_ERR;
     }
     while(1) {
@@ -4104,7 +4091,7 @@ static int rdbLoad(char *filename) {
             if ((dbid = rdbLoadLen(fp,NULL)) == REDIS_RDB_LENERR)
                 goto eoferr;
             if (dbid >= (unsigned)server.dbnum) {
-                redisLog(LOG_WARNING,"FATAL: Data file was created with a Redis server configured to handle more than %d databases. Exiting\n", server.dbnum);
+                redisLog(REDIS_WARNING,"FATAL: Data file was created with a Redis server configured to handle more than %d databases. Exiting\n", server.dbnum);
                 exit(1);
             }
             db = server.db+dbid;
@@ -4124,7 +4111,7 @@ static int rdbLoad(char *filename) {
         /* Add the new object in the hash table */
         retval = dictAdd(d,key,val);
         if (retval == DICT_ERR) {
-            redisLog(LOG_WARNING,"Loading DB, duplicated key (%s) found! Unrecoverable error, exiting now.", key->ptr);
+            redisLog(REDIS_WARNING,"Loading DB, duplicated key (%s) found! Unrecoverable error, exiting now.", key->ptr);
             exit(1);
         }
         loadedkeys++;
@@ -4167,19 +4154,19 @@ static int rdbLoad(char *filename) {
     return REDIS_OK;
 
 eoferr: /* unexpected end of file is handled here with a fatal exit */
-    redisLog(LOG_WARNING,"Short read or OOM loading DB. Unrecoverable error, aborting now.");
+    redisLog(REDIS_WARNING,"Short read or OOM loading DB. Unrecoverable error, aborting now.");
     exit(1);
     return REDIS_ERR; /* Just to avoid warning */
 }
 
 /*================================== Shutdown =============================== */
 static int prepareForShutdown() {
-    redisLog(LOG_WARNING,"User requested shutdown, saving DB...");
+    redisLog(REDIS_WARNING,"User requested shutdown, saving DB...");
     /* Kill the saving child if there is a background saving in progress.
        We want to avoid race conditions, for instance our saving child may
        overwrite the synchronous saving did by SHUTDOWN. */
     if (server.bgsavechildpid != -1) {
-        redisLog(LOG_WARNING,"There is a live saving child. Killing it!");
+        redisLog(REDIS_WARNING,"There is a live saving child. Killing it!");
         kill(server.bgsavechildpid,SIGKILL);
         rdbRemoveTempFile(server.bgsavechildpid);
     }
@@ -4192,18 +4179,18 @@ static int prepareForShutdown() {
         if (rdbSave(server.dbfilename) == REDIS_OK) {
             if (server.daemonize)
                 unlink(server.pidfile);
-            redisLog(LOG_WARNING,"%zu bytes used at exit",zmalloc_used_memory());
+            redisLog(REDIS_WARNING,"%zu bytes used at exit",zmalloc_used_memory());
         } else {
             /* Ooops.. error saving! The best we can do is to continue
              * operating. Note that if there was a background saving process,
              * in the next cron() Redis will be notified that the background
              * saving aborted, handling special stuff like slaves pending for
              * synchronization... */
-            redisLog(LOG_WARNING,"Error trying to save the DB, can't exit");
+            redisLog(REDIS_WARNING,"Error trying to save the DB, can't exit");
             return REDIS_ERR;
         }
     }
-    redisLog(LOG_WARNING,"Server exit now, bye bye...");
+    redisLog(REDIS_WARNING,"Server exit now, bye bye...");
     return REDIS_OK;
 }
 
@@ -7814,7 +7801,7 @@ static void syncCommand(redisClient *c) {
         return;
     }
 
-    redisLog(LOG_NOTICE,"Slave ask for synchronization");
+    redisLog(REDIS_NOTICE,"Slave ask for synchronization");
     /* Here we need to check if there is a background saving operation
      * in progress, or if it is required to start one */
     if (server.bgsavechildpid != -1) {
@@ -7836,18 +7823,18 @@ static void syncCommand(redisClient *c) {
             listRelease(c->reply);
             c->reply = listDup(slave->reply);
             c->replstate = REDIS_REPL_WAIT_BGSAVE_END;
-            redisLog(LOG_NOTICE,"Waiting for end of BGSAVE for SYNC");
+            redisLog(REDIS_NOTICE,"Waiting for end of BGSAVE for SYNC");
         } else {
             /* No way, we need to wait for the next BGSAVE in order to
              * register differences */
             c->replstate = REDIS_REPL_WAIT_BGSAVE_START;
-            redisLog(LOG_NOTICE,"Waiting for next BGSAVE for SYNC");
+            redisLog(REDIS_NOTICE,"Waiting for next BGSAVE for SYNC");
         }
     } else {
         /* Ok we don't have a BGSAVE in progress, let's start one */
-        redisLog(LOG_NOTICE,"Starting BGSAVE for SYNC");
+        redisLog(REDIS_NOTICE,"Starting BGSAVE for SYNC");
         if (rdbSaveBackground(server.dbfilename) != REDIS_OK) {
-            redisLog(LOG_NOTICE,"Replication failed, can't BGSAVE");
+            redisLog(REDIS_NOTICE,"Replication failed, can't BGSAVE");
             addReplySds(c,sdsnew("-ERR Unalbe to perform background save\r\n"));
             return;
         }
@@ -7887,13 +7874,13 @@ static void sendBulkToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
     lseek(slave->repldbfd,slave->repldboff,SEEK_SET);
     buflen = read(slave->repldbfd,buf,REDIS_IOBUF_LEN);
     if (buflen <= 0) {
-        redisLog(LOG_WARNING,"Read error sending DB to slave: %s",
+        redisLog(REDIS_WARNING,"Read error sending DB to slave: %s",
             (buflen == 0) ? "premature EOF" : strerror(errno));
         freeClient(slave);
         return;
     }
     if ((nwritten = write(fd,buf,buflen)) == -1) {
-        redisLog(LOG_INFO,"Write error sending DB to slave: %s",
+        redisLog(REDIS_VERBOSE,"Write error sending DB to slave: %s",
             strerror(errno));
         freeClient(slave);
         return;
@@ -7910,7 +7897,7 @@ static void sendBulkToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
             return;
         }
         addReplySds(slave,sdsempty());
-        redisLog(LOG_NOTICE,"Synchronization with slave succeeded");
+        redisLog(REDIS_NOTICE,"Synchronization with slave succeeded");
     }
 }
 
@@ -7937,13 +7924,13 @@ static void updateSlavesWaitingBgsave(int bgsaveerr) {
 
             if (bgsaveerr != REDIS_OK) {
                 freeClient(slave);
-                redisLog(LOG_WARNING,"SYNC failed. BGSAVE child returned an error");
+                redisLog(REDIS_WARNING,"SYNC failed. BGSAVE child returned an error");
                 continue;
             }
             if ((slave->repldbfd = open(server.dbfilename,O_RDONLY)) == -1 ||
                 redis_fstat(slave->repldbfd,&buf) == -1) {
                 freeClient(slave);
-                redisLog(LOG_WARNING,"SYNC failed. Can't open/stat DB after BGSAVE: %s", strerror(errno));
+                redisLog(REDIS_WARNING,"SYNC failed. Can't open/stat DB after BGSAVE: %s", strerror(errno));
                 continue;
             }
             slave->repldboff = 0;
@@ -7961,7 +7948,7 @@ static void updateSlavesWaitingBgsave(int bgsaveerr) {
             listIter li;
 
             listRewind(server.slaves,&li);
-            redisLog(LOG_WARNING,"SYNC failed. BGSAVE failed");
+            redisLog(REDIS_WARNING,"SYNC failed. BGSAVE failed");
             while((ln = listNext(&li))) {
                 redisClient *slave = ln->value;
 
@@ -7979,7 +7966,7 @@ static int syncWithMaster(void) {
     int dfd, maxtries = 5;
 
     if (fd == -1) {
-        redisLog(LOG_WARNING,"Unable to connect to MASTER: %s",
+        redisLog(REDIS_WARNING,"Unable to connect to MASTER: %s",
             strerror(errno));
         return REDIS_ERR;
     }
@@ -7989,20 +7976,20 @@ static int syncWithMaster(void) {
     	snprintf(authcmd, 1024, "AUTH %s\r\n", server.masterauth);
     	if (syncWrite(fd, authcmd, strlen(server.masterauth)+7, 5) == -1) {
             close(fd);
-            redisLog(LOG_WARNING,"Unable to AUTH to MASTER: %s",
+            redisLog(REDIS_WARNING,"Unable to AUTH to MASTER: %s",
                 strerror(errno));
             return REDIS_ERR;
     	}
         /* Read the AUTH result.  */
         if (syncReadLine(fd,buf,1024,3600) == -1) {
             close(fd);
-            redisLog(LOG_WARNING,"I/O error reading auth result from MASTER: %s",
+            redisLog(REDIS_WARNING,"I/O error reading auth result from MASTER: %s",
                 strerror(errno));
             return REDIS_ERR;
         }
         if (buf[0] != '+') {
             close(fd);
-            redisLog(LOG_WARNING,"Cannot AUTH to MASTER, is the masterauth password correct?");
+            redisLog(REDIS_WARNING,"Cannot AUTH to MASTER, is the masterauth password correct?");
             return REDIS_ERR;
         }
     }
@@ -8010,24 +7997,24 @@ static int syncWithMaster(void) {
     /* Issue the SYNC command */
     if (syncWrite(fd,"SYNC \r\n",7,5) == -1) {
         close(fd);
-        redisLog(LOG_WARNING,"I/O error writing to MASTER: %s",
+        redisLog(REDIS_WARNING,"I/O error writing to MASTER: %s",
             strerror(errno));
         return REDIS_ERR;
     }
     /* Read the bulk write count */
     if (syncReadLine(fd,buf,1024,3600) == -1) {
         close(fd);
-        redisLog(LOG_WARNING,"I/O error reading bulk count from MASTER: %s",
+        redisLog(REDIS_WARNING,"I/O error reading bulk count from MASTER: %s",
             strerror(errno));
         return REDIS_ERR;
     }
     if (buf[0] != '$') {
         close(fd);
-        redisLog(LOG_WARNING,"Bad protocol from MASTER, the first byte is not '$', are you sure the host and port are right?");
+        redisLog(REDIS_WARNING,"Bad protocol from MASTER, the first byte is not '$', are you sure the host and port are right?");
         return REDIS_ERR;
     }
     dumpsize = strtol(buf+1,NULL,10);
-    redisLog(LOG_NOTICE,"Receiving %ld bytes data dump from MASTER",dumpsize);
+    redisLog(REDIS_NOTICE,"Receiving %ld bytes data dump from MASTER",dumpsize);
     /* Read the bulk write data on a temp file */
     while(maxtries--) {
         snprintf(tmpfile,256,
@@ -8038,7 +8025,7 @@ static int syncWithMaster(void) {
     }
     if (dfd == -1) {
         close(fd);
-        redisLog(LOG_WARNING,"Opening the temp file needed for MASTER <-> SLAVE synchronization: %s",strerror(errno));
+        redisLog(REDIS_WARNING,"Opening the temp file needed for MASTER <-> SLAVE synchronization: %s",strerror(errno));
         return REDIS_ERR;
     }
     while(dumpsize) {
@@ -8046,7 +8033,7 @@ static int syncWithMaster(void) {
 
         nread = read(fd,buf,(dumpsize < 1024)?dumpsize:1024);
         if (nread == -1) {
-            redisLog(LOG_WARNING,"I/O error trying to sync with MASTER: %s",
+            redisLog(REDIS_WARNING,"I/O error trying to sync with MASTER: %s",
                 strerror(errno));
             close(fd);
             close(dfd);
@@ -8054,7 +8041,7 @@ static int syncWithMaster(void) {
         }
         nwritten = write(dfd,buf,nread);
         if (nwritten == -1) {
-            redisLog(LOG_WARNING,"Write error writing to the DB dump file needed for MASTER <-> SLAVE synchrnonization: %s", strerror(errno));
+            redisLog(REDIS_WARNING,"Write error writing to the DB dump file needed for MASTER <-> SLAVE synchrnonization: %s", strerror(errno));
             close(fd);
             close(dfd);
             return REDIS_ERR;
@@ -8063,14 +8050,14 @@ static int syncWithMaster(void) {
     }
     close(dfd);
     if (rename(tmpfile,server.dbfilename) == -1) {
-        redisLog(LOG_WARNING,"Failed trying to rename the temp DB into dump.rdb in MASTER <-> SLAVE synchronization: %s", strerror(errno));
+        redisLog(REDIS_WARNING,"Failed trying to rename the temp DB into dump.rdb in MASTER <-> SLAVE synchronization: %s", strerror(errno));
         unlink(tmpfile);
         close(fd);
         return REDIS_ERR;
     }
     emptyDb();
     if (rdbLoad(server.dbfilename) != REDIS_OK) {
-        redisLog(LOG_WARNING,"Failed trying to load the MASTER synchronization DB from disk");
+        redisLog(REDIS_WARNING,"Failed trying to load the MASTER synchronization DB from disk");
         close(fd);
         return REDIS_ERR;
     }
@@ -8089,7 +8076,7 @@ static void slaveofCommand(redisClient *c) {
             server.masterhost = NULL;
             if (server.master) freeClient(server.master);
             server.replstate = REDIS_REPL_NONE;
-            redisLog(LOG_NOTICE,"MASTER MODE enabled (user request)");
+            redisLog(REDIS_NOTICE,"MASTER MODE enabled (user request)");
         }
     } else {
         sdsfree(server.masterhost);
@@ -8097,7 +8084,7 @@ static void slaveofCommand(redisClient *c) {
         server.masterport = atoi(c->argv[2]->ptr);
         if (server.master) freeClient(server.master);
         server.replstate = REDIS_REPL_CONNECT;
-        redisLog(LOG_NOTICE,"SLAVE OF %s:%d enabled (user request)",
+        redisLog(REDIS_NOTICE,"SLAVE OF %s:%d enabled (user request)",
             server.masterhost, server.masterport);
     }
     addReply(c,shared.ok);
@@ -8194,9 +8181,9 @@ static void flushAppendOnlyFile(void) {
          * aborting instead of giving the illusion that everything is
          * working as expected. */
          if (nwritten == -1) {
-            redisLog(LOG_WARNING,"Exiting on error writing to the append-only file: %s",strerror(errno));
+            redisLog(REDIS_WARNING,"Exiting on error writing to the append-only file: %s",strerror(errno));
          } else {
-            redisLog(LOG_WARNING,"Exiting on short write while writing to the append-only file: %s",strerror(errno));
+            redisLog(REDIS_WARNING,"Exiting on short write while writing to the append-only file: %s",strerror(errno));
          }
          exit(1);
     }
@@ -8336,7 +8323,7 @@ int loadAppendOnlyFile(char *filename) {
         return REDIS_ERR;
 
     if (fp == NULL) {
-        redisLog(LOG_WARNING,"Fatal error: can't open the append log file for reading: %s",strerror(errno));
+        redisLog(REDIS_WARNING,"Fatal error: can't open the append log file for reading: %s",strerror(errno));
         exit(1);
     }
 
@@ -8375,7 +8362,7 @@ int loadAppendOnlyFile(char *filename) {
         /* Command lookup */
         cmd = lookupCommand(argv[0]->ptr);
         if (!cmd) {
-            redisLog(LOG_WARNING,"Unknown command '%s' reading the append only file", argv[0]->ptr);
+            redisLog(REDIS_WARNING,"Unknown command '%s' reading the append only file", argv[0]->ptr);
             exit(1);
         }
         /* Try object encoding */
@@ -8411,13 +8398,13 @@ int loadAppendOnlyFile(char *filename) {
 
 readerr:
     if (feof(fp)) {
-        redisLog(LOG_WARNING,"Unexpected end of file reading the append only file");
+        redisLog(REDIS_WARNING,"Unexpected end of file reading the append only file");
     } else {
-        redisLog(LOG_WARNING,"Unrecoverable error reading the append only file: %s", strerror(errno));
+        redisLog(REDIS_WARNING,"Unrecoverable error reading the append only file: %s", strerror(errno));
     }
     exit(1);
 fmterr:
-    redisLog(LOG_WARNING,"Bad file format reading the append only file");
+    redisLog(REDIS_WARNING,"Bad file format reading the append only file");
     exit(1);
 }
 
@@ -8496,7 +8483,7 @@ static int rewriteAppendOnlyFile(char *filename) {
     snprintf(tmpfile,256,"temp-rewriteaof-%d.aof", (int) getpid());
     fp = fopen(tmpfile,"w");
     if (!fp) {
-        redisLog(LOG_WARNING, "Failed rewriting the append only file: %s", strerror(errno));
+        redisLog(REDIS_WARNING, "Failed rewriting the append only file: %s", strerror(errno));
         return REDIS_ERR;
     }
     for (j = 0; j < server.dbnum; j++) {
@@ -8647,17 +8634,17 @@ static int rewriteAppendOnlyFile(char *filename) {
     /* Use RENAME to make sure the DB file is changed atomically only
      * if the generate DB file is ok. */
     if (rename(tmpfile,filename) == -1) {
-        redisLog(LOG_WARNING,"Error moving temp append only file on the final destination: %s", strerror(errno));
+        redisLog(REDIS_WARNING,"Error moving temp append only file on the final destination: %s", strerror(errno));
         unlink(tmpfile);
         return REDIS_ERR;
     }
-    redisLog(LOG_NOTICE,"SYNC append only file rewrite performed");
+    redisLog(REDIS_NOTICE,"SYNC append only file rewrite performed");
     return REDIS_OK;
 
 werr:
     fclose(fp);
     unlink(tmpfile);
-    redisLog(LOG_WARNING,"Write error writing append only file on disk: %s", strerror(errno));
+    redisLog(REDIS_WARNING,"Write error writing append only file on disk: %s", strerror(errno));
     if (di) dictReleaseIterator(di);
     return REDIS_ERR;
 }
@@ -8694,12 +8681,12 @@ static int rewriteAppendOnlyFileBackground(void) {
     } else {
         /* Parent */
         if (childpid == -1) {
-            redisLog(LOG_WARNING,
+            redisLog(REDIS_WARNING,
                 "Can't rewrite append only file in background: fork: %s",
                 strerror(errno));
             return REDIS_ERR;
         }
-        redisLog(LOG_NOTICE,
+        redisLog(REDIS_NOTICE,
             "Background append only file rewriting started by pid %d",childpid);
         server.bgrewritechildpid = childpid;
         updateDictResizePolicy();
@@ -8784,13 +8771,13 @@ static int startAppendOnly(void) {
     server.lastfsync = time(NULL);
     server.appendfd = open(server.appendfilename,O_WRONLY|O_APPEND|O_CREAT,0644);
     if (server.appendfd == -1) {
-        redisLog(LOG_WARNING,"Used tried to switch on AOF via CONFIG, but I can't open the AOF file: %s",strerror(errno));
+        redisLog(REDIS_WARNING,"Used tried to switch on AOF via CONFIG, but I can't open the AOF file: %s",strerror(errno));
         return REDIS_ERR;
     }
     if (rewriteAppendOnlyFileBackground() == REDIS_ERR) {
         server.appendonly = 0;
         close(server.appendfd);
-        redisLog(LOG_WARNING,"Used tried to switch on AOF via CONFIG, I can't trigger a background AOF rewrite operation. Check the above logs for more info about the error.",strerror(errno));
+        redisLog(REDIS_WARNING,"Used tried to switch on AOF via CONFIG, I can't trigger a background AOF rewrite operation. Check the above logs for more info about the error.",strerror(errno));
         return REDIS_ERR;
     }
     return REDIS_OK;
@@ -8807,13 +8794,13 @@ static void vmInit(void) {
     if (server.vm_max_threads != 0)
         zmalloc_enable_thread_safeness(); /* we need thread safe zmalloc() */
 
-    redisLog(LOG_NOTICE,"Using '%s' as swap file",server.vm_swap_file);
+    redisLog(REDIS_NOTICE,"Using '%s' as swap file",server.vm_swap_file);
     /* Try to open the old swap file, otherwise create it */
     if ((server.vm_fp = fopen(server.vm_swap_file,"r+b")) == NULL) {
         server.vm_fp = fopen(server.vm_swap_file,"w+b");
     }
     if (server.vm_fp == NULL) {
-        redisLog(LOG_WARNING,
+        redisLog(REDIS_WARNING,
             "Can't open the swap file: %s. Exiting.",
             strerror(errno));
         exit(1);
@@ -8825,7 +8812,7 @@ static void vmInit(void) {
     fl.l_whence = SEEK_SET;
     fl.l_start = fl.l_len = 0;
     if (fcntl(server.vm_fd,F_SETLK,&fl) == -1) {
-        redisLog(LOG_WARNING,
+        redisLog(REDIS_WARNING,
             "Can't lock the swap file at '%s': %s. Make sure it is not used by another Redis instance.", server.vm_swap_file, strerror(errno));
         exit(1);
     }
@@ -8837,16 +8824,16 @@ static void vmInit(void) {
     server.vm_stats_swapouts = 0;
     server.vm_stats_swapins = 0;
     totsize = server.vm_pages*server.vm_page_size;
-    redisLog(LOG_NOTICE,"Allocating %lld bytes of swap file",totsize);
+    redisLog(REDIS_NOTICE,"Allocating %lld bytes of swap file",totsize);
     if (ftruncate(server.vm_fd,totsize) == -1) {
-        redisLog(LOG_WARNING,"Can't ftruncate swap file: %s. Exiting.",
+        redisLog(REDIS_WARNING,"Can't ftruncate swap file: %s. Exiting.",
             strerror(errno));
         exit(1);
     } else {
-        redisLog(LOG_NOTICE,"Swap file allocated with success");
+        redisLog(REDIS_NOTICE,"Swap file allocated with success");
     }
     server.vm_bitmap = zmalloc((server.vm_pages+7)/8);
-    redisLog(LOG_INFO,"Allocated %lld bytes page table for %lld pages",
+    redisLog(REDIS_VERBOSE,"Allocated %lld bytes page table for %lld pages",
         (long long) (server.vm_pages+7)/8, server.vm_pages);
     memset(server.vm_bitmap,0,(server.vm_pages+7)/8);
 
@@ -8860,7 +8847,7 @@ static void vmInit(void) {
     pthread_mutex_init(&server.io_swapfile_mutex,NULL);
     server.io_active_threads = 0;
     if (pipe(pipefds) == -1) {
-        redisLog(LOG_WARNING,"Unable to intialized VM: pipe(2): %s. Exiting."
+        redisLog(REDIS_WARNING,"Unable to intialized VM: pipe(2): %s. Exiting."
             ,strerror(errno));
         exit(1);
     }
@@ -8893,7 +8880,7 @@ static void vmMarkPagesUsed(off_t page, off_t count) {
     for (j = 0; j < count; j++)
         vmMarkPageUsed(page+j);
     server.vm_stats_used_pages += count;
-    redisLog(LOG_DEBUG,"Mark USED pages: %lld pages at %lld\n",
+    redisLog(REDIS_DEBUG,"Mark USED pages: %lld pages at %lld\n",
         (long long)count, (long long)page);
 }
 
@@ -8912,7 +8899,7 @@ static void vmMarkPagesFree(off_t page, off_t count) {
     for (j = 0; j < count; j++)
         vmMarkPageFree(page+j);
     server.vm_stats_used_pages -= count;
-    redisLog(LOG_DEBUG,"Mark FREE pages: %lld pages at %lld\n",
+    redisLog(REDIS_DEBUG,"Mark FREE pages: %lld pages at %lld\n",
         (long long)count, (long long)page);
 }
 
@@ -8971,7 +8958,7 @@ static int vmFindContiguousPages(off_t *first, off_t n) {
             if (numfree == n) {
                 *first = this-(n-1);
                 server.vm_next_page = this+1;
-                redisLog(LOG_DEBUG, "FOUND CONTIGUOUS PAGES: %lld pages at %lld\n", (long long) n, (long long) *first);
+                redisLog(REDIS_DEBUG, "FOUND CONTIGUOUS PAGES: %lld pages at %lld\n", (long long) n, (long long) *first);
                 return REDIS_OK;
             }
         } else {
@@ -9001,7 +8988,7 @@ static int vmWriteObjectOnSwap(robj *o, off_t page) {
     if (server.vm_enabled) pthread_mutex_lock(&server.io_swapfile_mutex);
     if (fseeko(server.vm_fp,page*server.vm_page_size,SEEK_SET) == -1) {
         if (server.vm_enabled) pthread_mutex_unlock(&server.io_swapfile_mutex);
-        redisLog(LOG_WARNING,
+        redisLog(REDIS_WARNING,
             "Critical VM problem in vmWriteObjectOnSwap(): can't seek: %s",
             strerror(errno));
         return REDIS_ERR;
@@ -9030,7 +9017,7 @@ static int vmSwapObjectBlocking(robj *key, robj *val) {
     key->vtype = val->type;
     decrRefCount(val); /* Deallocate the object from memory. */
     vmMarkPagesUsed(page,pages);
-    redisLog(LOG_DEBUG,"VM: object %s swapped out at %lld (%lld pages)",
+    redisLog(REDIS_DEBUG,"VM: object %s swapped out at %lld (%lld pages)",
         (unsigned char*) key->ptr,
         (unsigned long long) page, (unsigned long long) pages);
     server.vm_stats_swapped_objects++;
@@ -9043,14 +9030,14 @@ static robj *vmReadObjectFromSwap(off_t page, int type) {
 
     if (server.vm_enabled) pthread_mutex_lock(&server.io_swapfile_mutex);
     if (fseeko(server.vm_fp,page*server.vm_page_size,SEEK_SET) == -1) {
-        redisLog(LOG_WARNING,
+        redisLog(REDIS_WARNING,
             "Unrecoverable VM problem in vmReadObjectFromSwap(): can't seek: %s",
             strerror(errno));
         _exit(1);
     }
     o = rdbLoadObject(type,server.vm_fp);
     if (o == NULL) {
-        redisLog(LOG_WARNING, "Unrecoverable VM problem in vmReadObjectFromSwap(): can't load object from swap file: %s", strerror(errno));
+        redisLog(REDIS_WARNING, "Unrecoverable VM problem in vmReadObjectFromSwap(): can't load object from swap file: %s", strerror(errno));
         _exit(1);
     }
     if (server.vm_enabled) pthread_mutex_unlock(&server.io_swapfile_mutex);
@@ -9071,11 +9058,11 @@ static robj *vmGenericLoadObject(robj *key, int preview) {
         key->storage = REDIS_VM_MEMORY;
         key->vm.atime = server.unixtime;
         vmMarkPagesFree(key->vm.page,key->vm.usedpages);
-        redisLog(LOG_DEBUG, "VM: object %s loaded from disk",
+        redisLog(REDIS_DEBUG, "VM: object %s loaded from disk",
             (unsigned char*) key->ptr);
         server.vm_stats_swapped_objects--;
     } else {
-        redisLog(LOG_DEBUG, "VM: object %s previewed from disk",
+        redisLog(REDIS_DEBUG, "VM: object %s previewed from disk",
             (unsigned char*) key->ptr);
     }
     server.vm_stats_swapins++;
@@ -9250,7 +9237,7 @@ static int vmSwapOneObject(int usethreads) {
     key = dictGetEntryKey(best);
     val = dictGetEntryVal(best);
 
-    redisLog(LOG_DEBUG,"Key with best swappability: %s, %f",
+    redisLog(REDIS_DEBUG,"Key with best swappability: %s, %f",
         key->ptr, best_swappability);
 
     /* Unshare the key if needed */
@@ -9335,7 +9322,7 @@ static void vmThreadedIOCompletedJob(aeEventLoop *el, int fd, void *privdata,
         robj *key;
         struct dictEntry *de;
 
-        redisLog(LOG_DEBUG,"Processing I/O completed job");
+        redisLog(REDIS_DEBUG,"Processing I/O completed job");
 
         /* Get the processed element (the oldest one) */
         lockThreadedIO();
@@ -9355,7 +9342,7 @@ static void vmThreadedIOCompletedJob(aeEventLoop *el, int fd, void *privdata,
         }
         /* Post process it in the main thread, as there are things we
          * can do just here to avoid race conditions and/or invasive locks */
-        redisLog(LOG_DEBUG,"Job %p type: %d, key at %p (%s) refcount: %d\n", (void*) j, j->type, (void*)j->key, (char*)j->key->ptr, j->key->refcount);
+        redisLog(REDIS_DEBUG,"Job %p type: %d, key at %p (%s) refcount: %d\n", (void*) j, j->type, (void*)j->key, (char*)j->key->ptr, j->key->refcount);
         de = dictFind(j->db->dict,j->key);
         assert(de != NULL);
         key = dictGetEntryKey(de);
@@ -9366,7 +9353,7 @@ static void vmThreadedIOCompletedJob(aeEventLoop *el, int fd, void *privdata,
             key->storage = REDIS_VM_MEMORY;
             key->vm.atime = server.unixtime;
             vmMarkPagesFree(key->vm.page,key->vm.usedpages);
-            redisLog(LOG_DEBUG, "VM: object %s loaded from disk (threaded)",
+            redisLog(REDIS_DEBUG, "VM: object %s loaded from disk (threaded)",
                 (unsigned char*) key->ptr);
             server.vm_stats_swapped_objects--;
             server.vm_stats_swapins++;
@@ -9417,7 +9404,7 @@ static void vmThreadedIOCompletedJob(aeEventLoop *el, int fd, void *privdata,
             key->vtype = j->val->type;
             decrRefCount(val); /* Deallocate the object from memory. */
             dictGetEntryVal(de) = NULL;
-            redisLog(LOG_DEBUG,
+            redisLog(REDIS_DEBUG,
                 "VM: object %s swapped out at %lld (%lld pages) (threaded)",
                 (unsigned char*) key->ptr,
                 (unsigned long long) j->page, (unsigned long long) j->pages);
@@ -9447,7 +9434,7 @@ static void vmThreadedIOCompletedJob(aeEventLoop *el, int fd, void *privdata,
         if (processed == toprocess) return;
     }
     if (retval < 0 && errno != EAGAIN) {
-        redisLog(LOG_WARNING,
+        redisLog(REDIS_WARNING,
             "WARNING: read(2) error in vmThreadedIOCompletedJob() %s",
             strerror(errno));
     }
@@ -9485,7 +9472,7 @@ again:
 
             if (job->canceled) continue; /* Skip this, already canceled. */
             if (job->key == o) {
-                redisLog(LOG_DEBUG,"*** CANCELED %p (%s) (type %d) (LIST ID %d)\n",
+                redisLog(REDIS_DEBUG,"*** CANCELED %p (%s) (type %d) (LIST ID %d)\n",
                     (void*)job, (char*)o->ptr, job->type, i);
                 /* Mark the pages as free since the swap didn't happened
                  * or happened but is now discarded. */
@@ -9553,7 +9540,7 @@ static void *IOThreadEntryPoint(void *arg) {
         lockThreadedIO();
         if (listLength(server.io_newjobs) == 0) {
             /* No new jobs in queue, exit. */
-            redisLog(LOG_DEBUG,"Thread %ld exiting, nothing to do",
+            redisLog(REDIS_DEBUG,"Thread %ld exiting, nothing to do",
                 (long) pthread_self());
             server.io_active_threads--;
             unlockThreadedIO();
@@ -9567,7 +9554,7 @@ static void *IOThreadEntryPoint(void *arg) {
         listAddNodeTail(server.io_processing,j);
         ln = listLast(server.io_processing); /* We use ln later to remove it */
         unlockThreadedIO();
-        redisLog(LOG_DEBUG,"Thread %ld got a new job (type %d): %p about key '%s'",
+        redisLog(REDIS_DEBUG,"Thread %ld got a new job (type %d): %p about key '%s'",
             (long) pthread_self(), j->type, (void*)j, (char*)j->key->ptr);
 
         /* Process the Job */
@@ -9583,7 +9570,7 @@ static void *IOThreadEntryPoint(void *arg) {
         }
 
         /* Done: insert the job into the processed queue */
-        redisLog(LOG_DEBUG,"Thread %ld completed the job: %p (key %s)",
+        redisLog(REDIS_DEBUG,"Thread %ld completed the job: %p (key %s)",
             (long) pthread_self(), (void*)j, (char*)j->key->ptr);
         lockThreadedIO();
         listDelNode(server.io_processing,ln);
@@ -9607,7 +9594,7 @@ static void spawnIOThread(void) {
     sigaddset(&mask,SIGPIPE);
     pthread_sigmask(SIG_SETMASK, &mask, &omask);
     while ((err = pthread_create(&thread,&server.io_threads_attr,IOThreadEntryPoint,NULL)) != 0) {
-        redisLog(LOG_WARNING,"Unable to spawn an I/O thread: %s",
+        redisLog(REDIS_WARNING,"Unable to spawn an I/O thread: %s",
             strerror(err));
         usleep(1000000);
     }
@@ -9649,7 +9636,7 @@ static void vmReopenSwapFile(void) {
      * and don't want to mess at all with the original file object. */
     server.vm_fp = fopen(server.vm_swap_file,"r+b");
     if (server.vm_fp == NULL) {
-        redisLog(LOG_WARNING,"Can't re-open the VM swap file: %s. Exiting.",
+        redisLog(REDIS_WARNING,"Can't re-open the VM swap file: %s. Exiting.",
             server.vm_swap_file);
         _exit(1);
     }
@@ -9658,7 +9645,7 @@ static void vmReopenSwapFile(void) {
 
 /* This function must be called while with threaded IO locked */
 static void queueIOJob(iojob *j) {
-    redisLog(LOG_DEBUG,"Queued IO Job %p type %d about key '%s'\n",
+    redisLog(REDIS_DEBUG,"Queued IO Job %p type %d about key '%s'\n",
         (void*)j, j->type, (char*)j->key->ptr);
     listAddNodeTail(server.io_newjobs,j);
     if (server.io_active_threads < server.vm_max_threads)
@@ -10554,7 +10541,7 @@ static void debugCommand(redisClient *c) {
             addReply(c,shared.err);
             return;
         }
-        redisLog(LOG_WARNING,"DB reloaded by DEBUG RELOAD");
+        redisLog(REDIS_WARNING,"DB reloaded by DEBUG RELOAD");
         addReply(c,shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr,"loadaof")) {
         emptyDb();
@@ -10562,7 +10549,7 @@ static void debugCommand(redisClient *c) {
             addReply(c,shared.err);
             return;
         }
-        redisLog(LOG_WARNING,"Append Only File loaded by DEBUG LOADAOF");
+        redisLog(REDIS_WARNING,"Append Only File loaded by DEBUG LOADAOF");
         addReply(c,shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr,"object") && c->argc == 3) {
         dictEntry *de = dictFind(c->db->dict,c->argv[2]);
@@ -10666,19 +10653,19 @@ static void debugCommand(redisClient *c) {
 }
 
 static void _redisAssert(char *estr, char *file, int line) {
-    redisLog(LOG_WARNING,"=== ASSERTION FAILED ===");
-    redisLog(LOG_WARNING,"==> %s:%d '%s' is not true",file,line,estr);
+    redisLog(REDIS_WARNING,"=== ASSERTION FAILED ===");
+    redisLog(REDIS_WARNING,"==> %s:%d '%s' is not true",file,line,estr);
 #ifdef HAVE_BACKTRACE
-    redisLog(LOG_WARNING,"(forcing SIGSEGV in order to print the stack trace)");
+    redisLog(REDIS_WARNING,"(forcing SIGSEGV in order to print the stack trace)");
     *((char*)-1) = 'x';
 #endif
 }
 
 static void _redisPanic(char *msg, char *file, int line) {
-    redisLog(LOG_WARNING,"!!! Software Failure. Press left mouse button to continue");
-    redisLog(LOG_WARNING,"Guru Meditation: %s #%s:%d",msg,file,line);
+    redisLog(REDIS_WARNING,"!!! Software Failure. Press left mouse button to continue");
+    redisLog(REDIS_WARNING,"Guru Meditation: %s #%s:%d",msg,file,line);
 #ifdef HAVE_BACKTRACE
-    redisLog(LOG_WARNING,"(forcing SIGSEGV in order to print the stack trace)");
+    redisLog(REDIS_WARNING,"(forcing SIGSEGV in order to print the stack trace)");
     *((char*)-1) = 'x';
 #endif
 }
@@ -10702,7 +10689,7 @@ int linuxOvercommitMemoryValue(void) {
 
 void linuxOvercommitMemoryWarning(void) {
     if (linuxOvercommitMemoryValue() == 0) {
-        redisLog(LOG_WARNING,"WARNING overcommit_memory is set to 0! Background save may fail under low memory condition. To fix this issue add 'vm.overcommit_memory = 1' to /etc/sysctl.conf and then reboot or run the command 'sysctl vm.overcommit_memory=1' for this to take effect.");
+        redisLog(REDIS_WARNING,"WARNING overcommit_memory is set to 0! Background save may fail under low memory condition. To fix this issue add 'vm.overcommit_memory = 1' to /etc/sysctl.conf and then reboot or run the command 'sysctl vm.overcommit_memory=1' for this to take effect.");
     }
 }
 #endif /* __linux__ */
@@ -10755,23 +10742,23 @@ int main(int argc, char **argv) {
     } else if ((argc > 2)) {
         usage();
     } else {
-        redisLog(LOG_WARNING,"Warning: no config file specified, using the default config. In order to specify a config file use 'redis-server /path/to/redis.conf'");
+        redisLog(REDIS_WARNING,"Warning: no config file specified, using the default config. In order to specify a config file use 'redis-server /path/to/redis.conf'");
     }
     if (server.daemonize) daemonize();
     initServer();
-    redisLog(LOG_NOTICE,"Server started, Redis version " REDIS_VERSION);
+    redisLog(REDIS_NOTICE,"Server started, Redis version " REDIS_VERSION);
 #ifdef __linux__
     linuxOvercommitMemoryWarning();
 #endif
     start = time(NULL);
     if (server.appendonly) {
         if (loadAppendOnlyFile(server.appendfilename) == REDIS_OK)
-            redisLog(LOG_NOTICE,"DB loaded from append only file: %ld seconds",time(NULL)-start);
+            redisLog(REDIS_NOTICE,"DB loaded from append only file: %ld seconds",time(NULL)-start);
     } else {
         if (rdbLoad(server.dbfilename) == REDIS_OK)
-            redisLog(LOG_NOTICE,"DB loaded from disk: %ld seconds",time(NULL)-start);
+            redisLog(REDIS_NOTICE,"DB loaded from disk: %ld seconds",time(NULL)-start);
     }
-    redisLog(LOG_NOTICE,"The server is now ready to accept connections on port %d", server.port);
+    redisLog(REDIS_NOTICE,"The server is now ready to accept connections on port %d", server.port);
     aeSetBeforeSleepProc(server.el,beforeSleep);
     aeMain(server.el);
     aeDeleteEventLoop(server.el);
@@ -10818,10 +10805,10 @@ static void segvHandler(int sig, siginfo_t *info, void *secret) {
     sds infostring;
     REDIS_NOTUSED(info);
 
-    redisLog(LOG_WARNING,
+    redisLog(REDIS_WARNING,
         "======= Ooops! Redis %s got signal: -%d- =======", REDIS_VERSION, sig);
     infostring = genRedisInfoString();
-    redisLog(LOG_WARNING, "%s",infostring);
+    redisLog(REDIS_WARNING, "%s",infostring);
     /* It's not safe to sdsfree() the returned string under memory
      * corruption conditions. Let it leak as we are going to abort */
 
@@ -10837,9 +10824,9 @@ static void segvHandler(int sig, siginfo_t *info, void *secret) {
 
         p = strchr(messages[i],'+');
         if (!fn || (p && ((unsigned long)strtol(p+1,NULL,10)) < offset)) {
-            redisLog(LOG_WARNING,"%s", messages[i]);
+            redisLog(REDIS_WARNING,"%s", messages[i]);
         } else {
-            redisLog(LOG_WARNING,"%d redis-server %p %s + %d", i, trace[i], fn, (unsigned int)offset);
+            redisLog(REDIS_WARNING,"%d redis-server %p %s + %d", i, trace[i], fn, (unsigned int)offset);
         }
     }
     /* free(messages); Don't call free() with possibly corrupted memory. */
@@ -10849,7 +10836,7 @@ static void segvHandler(int sig, siginfo_t *info, void *secret) {
 static void sigtermHandler(int sig) {
     REDIS_NOTUSED(sig);
 
-    redisLog(LOG_WARNING,"SIGTERM received, scheduling shutting down...");
+    redisLog(REDIS_WARNING,"SIGTERM received, scheduling shutting down...");
     server.shutdown_asap = 1;
 }
 
